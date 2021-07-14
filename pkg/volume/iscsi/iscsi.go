@@ -25,9 +25,10 @@ import (
 	"strings"
 
 	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
+	"k8s.io/utils/io"
 	"k8s.io/utils/keymutex"
-	"k8s.io/utils/mount"
 	utilstrings "k8s.io/utils/strings"
 
 	v1 "k8s.io/api/core/v1"
@@ -79,7 +80,7 @@ func (plugin *iscsiPlugin) CanSupport(spec *volume.Spec) bool {
 	return (spec.Volume != nil && spec.Volume.ISCSI != nil) || (spec.PersistentVolume != nil && spec.PersistentVolume.Spec.ISCSI != nil)
 }
 
-func (plugin *iscsiPlugin) RequiresRemount() bool {
+func (plugin *iscsiPlugin) RequiresRemount(spec *volume.Spec) bool {
 	return false
 }
 
@@ -161,12 +162,20 @@ func (plugin *iscsiPlugin) newBlockVolumeMapperInternal(spec *volume.Spec, podUI
 	if err != nil {
 		return nil, err
 	}
-	return &iscsiDiskMapper{
+	mapper := &iscsiDiskMapper{
 		iscsiDisk:  iscsiDisk,
 		readOnly:   readOnly,
 		exec:       exec,
 		deviceUtil: ioutil.NewDeviceHandler(ioutil.NewIOHandler()),
-	}, nil
+	}
+
+	blockPath, err := mapper.GetGlobalMapPath(spec)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get device path: %v", err)
+	}
+	mapper.MetricsProvider = volume.NewMetricsBlock(filepath.Join(blockPath, string(podUID)))
+
+	return mapper, nil
 }
 
 func (plugin *iscsiPlugin) NewUnmounter(volName string, podUID types.UID) (volume.Unmounter, error) {
@@ -211,6 +220,11 @@ func (plugin *iscsiPlugin) ConstructVolumeSpec(volumeName, mountPath string) (*v
 	var globalPDPath string
 	mounter := plugin.host.GetMounter(plugin.GetPluginName())
 	paths, err := mounter.GetMountRefs(mountPath)
+	if io.IsInconsistentReadError(err) {
+		klog.Errorf("Failed to read mount refs from /proc/mounts for %s: %s", mountPath, err)
+		klog.Errorf("Kubelet cannot unmount volume at %s, please unmount it and all mounts of the same device manually.", mountPath)
+		return nil, err
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +297,7 @@ type iscsiDisk struct {
 	Iface         string
 	chapDiscovery bool
 	chapSession   bool
-	secret        map[string]string
+	secret        map[string]string `datapolicy:"token"`
 	InitiatorName string
 	plugin        *iscsiPlugin
 	// Utility interface that provides API calls to the provider to attach/detach disks.
@@ -385,6 +399,13 @@ type iscsiDiskUnmapper struct {
 	*iscsiDisk
 	exec       utilexec.Interface
 	deviceUtil ioutil.DeviceUtil
+	volume.MetricsNil
+}
+
+// SupportsMetrics returns true for SupportsMetrics as it initializes the
+// MetricsProvider.
+func (idm *iscsiDiskMapper) SupportsMetrics() bool {
+	return true
 }
 
 var _ volume.BlockVolumeUnmapper = &iscsiDiskUnmapper{}

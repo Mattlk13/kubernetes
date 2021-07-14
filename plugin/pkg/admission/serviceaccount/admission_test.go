@@ -129,7 +129,7 @@ func TestRejectsMirrorPodWithSecretVolumes(t *testing.T) {
 		},
 		Spec: api.PodSpec{
 			Volumes: []api.Volume{
-				{VolumeSource: api.VolumeSource{Secret: &api.SecretVolumeSource{}}},
+				{VolumeSource: api.VolumeSource{Secret: &api.SecretVolumeSource{SecretName: "mysecret"}}},
 			},
 		},
 	}
@@ -255,6 +255,7 @@ func TestAssignsDefaultServiceAccountAndBoundTokenWithNoSecretTokens(t *testing.
 					{ServiceAccountToken: &api.ServiceAccountTokenProjection{ExpirationSeconds: 3607, Path: "token"}},
 					{ConfigMap: &api.ConfigMapProjection{LocalObjectReference: api.LocalObjectReference{Name: "kube-root-ca.crt"}, Items: []api.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}}}},
 					{DownwardAPI: &api.DownwardAPIProjection{Items: []api.DownwardAPIVolumeFile{{Path: "namespace", FieldRef: &api.ObjectFieldSelector{APIVersion: "v1", FieldPath: "metadata.namespace"}}}}},
+					{ConfigMap: &api.ConfigMapProjection{LocalObjectReference: api.LocalObjectReference{Name: "openshift-service-ca.crt"}, Items: []api.KeyToPath{{Key: "service-ca.crt", Path: "service-ca.crt"}}}},
 				},
 			},
 		},

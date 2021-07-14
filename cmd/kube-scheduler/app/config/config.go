@@ -19,7 +19,6 @@ package config
 import (
 	apiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/client-go/informers"
-	coreinformers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/events"
@@ -43,13 +42,15 @@ type Config struct {
 
 	Client          clientset.Interface
 	InformerFactory informers.SharedInformerFactory
-	PodInformer     coreinformers.PodInformer
 
 	//lint:ignore SA1019 this deprecated field still needs to be used for now. It will be removed once the migration is done.
 	EventBroadcaster events.EventBroadcasterAdapter
 
 	// LeaderElection is optional.
 	LeaderElection *leaderelection.LeaderElectionConfig
+
+	// OpenShiftContext is additional context that we need to launch the kube-scheduler for openshift
+	OpenShiftContext OpenShiftContext
 }
 
 type completedConfig struct {

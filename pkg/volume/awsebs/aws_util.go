@@ -27,7 +27,7 @@ import (
 	"time"
 
 	"k8s.io/klog/v2"
-	"k8s.io/utils/mount"
+	"k8s.io/mount-utils"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -41,8 +41,9 @@ import (
 )
 
 const (
-	diskPartitionSuffix = ""
-	checkSleepDuration  = time.Second
+	diskPartitionSuffix     = ""
+	nvmeDiskPartitionSuffix = "p"
+	checkSleepDuration      = time.Second
 )
 
 // AWSDiskUtil provides operations for EBS volume.
@@ -176,7 +177,7 @@ func populateVolumeOptions(pluginName, pvcName string, capacityGB resource.Quant
 		case "iopspergb":
 			volumeOptions.IOPSPerGB, err = strconv.Atoi(v)
 			if err != nil {
-				return nil, fmt.Errorf("invalid iopsPerGB value %q, must be integer between 1 and 30: %v", v, err)
+				return nil, fmt.Errorf("invalid iopsPerGB value %q: %v", v, err)
 			}
 		case "encrypted":
 			volumeOptions.Encrypted, err = strconv.ParseBool(v)
@@ -240,6 +241,9 @@ func getDiskByIDPaths(volumeID aws.KubernetesVolumeID, partition string, deviceP
 		if err != nil {
 			klog.Warningf("error looking for nvme volume %q: %v", volumeID, err)
 		} else if nvmePath != "" {
+			if partition != "" {
+				nvmePath = nvmePath + nvmeDiskPartitionSuffix + partition
+			}
 			devicePaths = append(devicePaths, nvmePath)
 		}
 	}

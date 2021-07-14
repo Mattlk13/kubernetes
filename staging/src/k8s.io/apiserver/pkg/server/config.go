@@ -53,6 +53,7 @@ import (
 	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
 	authorizerunion "k8s.io/apiserver/pkg/authorization/union"
 	"k8s.io/apiserver/pkg/endpoints/discovery"
+	"k8s.io/apiserver/pkg/endpoints/filterlatency"
 	genericapifilters "k8s.io/apiserver/pkg/endpoints/filters"
 	apiopenapi "k8s.io/apiserver/pkg/endpoints/openapi"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
@@ -64,6 +65,7 @@ import (
 	"k8s.io/apiserver/pkg/server/healthz"
 	"k8s.io/apiserver/pkg/server/routes"
 	serverstore "k8s.io/apiserver/pkg/server/storage"
+	"k8s.io/apiserver/pkg/storageversion"
 	"k8s.io/apiserver/pkg/util/feature"
 	utilflowcontrol "k8s.io/apiserver/pkg/util/flowcontrol"
 	"k8s.io/client-go/informers"
@@ -115,7 +117,7 @@ type Config struct {
 	// to set values and determine whether its allowed
 	AdmissionControl      admission.Interface
 	CorsAllowedOriginList []string
-
+	HSTSDirectives        []string
 	// FlowControl, if not nil, gives priority and fairness to request handling
 	FlowControl utilflowcontrol.Interface
 
@@ -168,6 +170,8 @@ type Config struct {
 	Serializer runtime.NegotiatedSerializer
 	// OpenAPIConfig will be used in generating OpenAPI spec. This is nil by default. Use DefaultOpenAPIConfig for "working" defaults.
 	OpenAPIConfig *openapicommon.Config
+	// SkipOpenAPIInstallation avoids installing the OpenAPI handler if set to true.
+	SkipOpenAPIInstallation bool
 
 	// RESTOptionsGetter is used to construct RESTStorage types via the generic registry.
 	RESTOptionsGetter genericregistry.RESTOptionsGetter
@@ -231,6 +235,12 @@ type Config struct {
 	// EquivalentResourceRegistry provides information about resources equivalent to a given resource,
 	// and the kind associated with a given resource. As resources are installed, they are registered here.
 	EquivalentResourceRegistry runtime.EquivalentResourceRegistry
+
+	// APIServerID is the ID of this API server
+	APIServerID string
+
+	// StorageVersionManager holds the storage versions of the API resources installed by this server.
+	StorageVersionManager storageversion.Manager
 
 	// hasBeenReadyCh is closed when /readyz succeeds for the first time.
 	hasBeenReadyCh chan struct{}
@@ -305,6 +315,10 @@ type AuthorizationInfo struct {
 // NewConfig returns a Config struct with the default values
 func NewConfig(codecs serializer.CodecFactory) *Config {
 	defaultHealthChecks := []healthz.HealthChecker{healthz.PingHealthz, healthz.LogHealthz}
+	var id string
+	if feature.DefaultFeatureGate.Enabled(features.APIServerIdentity) {
+		id = "kube-apiserver-" + uuid.New().String()
+	}
 	return &Config{
 		Serializer:                  codecs,
 		BuildHandlerChainFunc:       DefaultBuildHandlerChain,
@@ -342,7 +356,9 @@ func NewConfig(codecs serializer.CodecFactory) *Config {
 
 		// Default to treating watch as a long-running operation
 		// Generic API servers have no inherent long-running subresources
-		LongRunningFunc: genericfilters.BasicLongRunningRequestCheck(sets.NewString("watch"), sets.NewString()),
+		LongRunningFunc:       genericfilters.BasicLongRunningRequestCheck(sets.NewString("watch"), sets.NewString()),
+		APIServerID:           id,
+		StorageVersionManager: storageversion.NewDefaultManager(),
 
 		hasBeenReadyCh: make(chan struct{}),
 	}
@@ -572,7 +588,7 @@ func eventReference() (*corev1.ObjectReference, error) {
 	}
 	if len(ns) == 0 {
 		pod = ""
-		ns = "kube-system"
+		ns = "openshift-kube-apiserver"
 	}
 	if len(pod) == 0 {
 		return &corev1.ObjectReference{
@@ -591,7 +607,7 @@ func eventReference() (*corev1.ObjectReference, error) {
 }
 
 // New creates a new server which logically combines the handling chain with the passed server.
-// name is used to differentiate for logging. The handler chain in particular can be difficult as it starts delgating.
+// name is used to differentiate for logging. The handler chain in particular can be difficult as it starts delegating.
 // delegationTarget may not be nil.
 func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*GenericAPIServer, error) {
 	if c.Serializer == nil {
@@ -631,7 +647,8 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 
 		listedPathProvider: apiServerHandler,
 
-		openAPIConfig: c.OpenAPIConfig,
+		openAPIConfig:           c.OpenAPIConfig,
+		skipOpenAPIInstallation: c.SkipOpenAPIInstallation,
 
 		postStartHooks:         map[string]postStartHookEntry{},
 		preShutdownHooks:       map[string]preShutdownHookEntry{},
@@ -648,6 +665,9 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 
 		maxRequestBodyBytes: c.MaxRequestBodyBytes,
 		livezClock:          clock.RealClock{},
+
+		APIServerID:           c.APIServerID,
+		StorageVersionManager: c.StorageVersionManager,
 
 		eventSink: c.EventSink,
 	}
@@ -700,7 +720,7 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 			}
 		}
 		// TODO: Once we get rid of /healthz consider changing this to post-start-hook.
-		err := s.addReadyzChecks(healthz.NewInformerSyncHealthz(c.SharedInformerFactory))
+		err := s.AddReadyzChecks(healthz.NewInformerSyncHealthz(c.SharedInformerFactory))
 		if err != nil {
 			return nil, err
 		}
@@ -720,6 +740,31 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 		// TODO(yue9944882): plumb pre-shutdown-hook for request-management system?
 	} else {
 		klog.V(3).Infof("Not requested to run hook %s", priorityAndFairnessConfigConsumerHookName)
+	}
+
+	// Add PostStartHooks for maintaining the watermarks for the Priority-and-Fairness and the Max-in-Flight filters.
+	if c.FlowControl != nil {
+		const priorityAndFairnessFilterHookName = "priority-and-fairness-filter"
+		if !s.isPostStartHookRegistered(priorityAndFairnessFilterHookName) {
+			err := s.AddPostStartHook(priorityAndFairnessFilterHookName, func(context PostStartHookContext) error {
+				genericfilters.StartPriorityAndFairnessWatermarkMaintenance(context.StopCh)
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		const maxInFlightFilterHookName = "max-in-flight-filter"
+		if !s.isPostStartHookRegistered(maxInFlightFilterHookName) {
+			err := s.AddPostStartHook(maxInFlightFilterHookName, func(context PostStartHookContext) error {
+				genericfilters.StartMaxInFlightWatermarkMaintenance(context.StopCh)
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	for _, delegateCheck := range delegationTarget.HealthzChecks() {
@@ -752,20 +797,49 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 	return s, nil
 }
 
+func BuildHandlerChainWithStorageVersionPrecondition(apiHandler http.Handler, c *Config) http.Handler {
+	// WithStorageVersionPrecondition needs the WithRequestInfo to run first
+	handler := genericapifilters.WithStorageVersionPrecondition(apiHandler, c.StorageVersionManager, c.Serializer)
+	return DefaultBuildHandlerChain(handler, c)
+}
+
 func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
-	handler := genericapifilters.WithAuthorization(apiHandler, c.Authorization.Authorizer, c.Serializer)
+	handler := filterlatency.TrackCompleted(apiHandler)
+	handler = genericapifilters.WithAuthorization(handler, c.Authorization.Authorizer, c.Serializer)
+	handler = filterlatency.TrackStarted(handler, "authorization")
+
 	if c.FlowControl != nil {
+		handler = filterlatency.TrackCompleted(handler)
 		handler = genericfilters.WithPriorityAndFairness(handler, c.LongRunningFunc, c.FlowControl)
+		handler = filterlatency.TrackStarted(handler, "priorityandfairness")
 	} else {
 		handler = genericfilters.WithMaxInFlightLimit(handler, c.MaxRequestsInFlight, c.MaxMutatingRequestsInFlight, c.LongRunningFunc)
 	}
+
+	handler = filterlatency.TrackCompleted(handler)
 	handler = genericapifilters.WithImpersonation(handler, c.Authorization.Authorizer, c.Serializer)
+	handler = filterlatency.TrackStarted(handler, "impersonation")
+
+	handler = filterlatency.TrackCompleted(handler)
 	handler = genericapifilters.WithAudit(handler, c.AuditBackend, c.AuditPolicyChecker, c.LongRunningFunc)
+	handler = filterlatency.TrackStarted(handler, "audit")
+
 	failedHandler := genericapifilters.Unauthorized(c.Serializer)
 	failedHandler = genericapifilters.WithFailedAuthenticationAudit(failedHandler, c.AuditBackend, c.AuditPolicyChecker)
+
+	failedHandler = filterlatency.TrackCompleted(failedHandler)
+	handler = filterlatency.TrackCompleted(handler)
 	handler = genericapifilters.WithAuthentication(handler, c.Authentication.Authenticator, failedHandler, c.Authentication.APIAudiences)
+	handler = filterlatency.TrackStarted(handler, "authentication")
+
 	handler = genericfilters.WithCORS(handler, c.CorsAllowedOriginList, nil, nil, nil, "true")
-	handler = genericfilters.WithTimeoutForNonLongRunningRequests(handler, c.LongRunningFunc, c.RequestTimeout)
+
+	// WithTimeoutForNonLongRunningRequests will call the rest of the request handling in a go-routine with the
+	// context with deadline. The go-routine can keep running, while the timeout logic will return a timeout to the client.
+	handler = genericfilters.WithTimeoutForNonLongRunningRequests(handler, c.LongRunningFunc)
+
+	handler = genericapifilters.WithRequestDeadline(handler, c.AuditBackend, c.AuditPolicyChecker,
+		c.LongRunningFunc, c.Serializer, c.RequestTimeout)
 	handler = genericfilters.WithWaitGroup(handler, c.LongRunningFunc, c.HandlerChainWaitGroup)
 	handler = WithNonReadyRequestLogging(handler, c.hasBeenReadyCh)
 	handler = WithLateConnectionFilter(handler)
@@ -776,8 +850,11 @@ func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
 	handler = genericapifilters.WithAuditAnnotations(handler, c.AuditBackend, c.AuditPolicyChecker)
 	handler = genericapifilters.WithWarningRecorder(handler)
 	handler = genericapifilters.WithCacheControl(handler)
+	handler = genericfilters.WithHSTS(handler, c.HSTSDirectives)
+	handler = genericfilters.WithHTTPLogging(handler, c.IsTerminating)
 	handler = genericapifilters.WithRequestReceivedTimestamp(handler)
-	handler = genericfilters.WithPanicRecovery(handler, c.IsTerminating)
+	handler = genericfilters.WithPanicRecovery(handler, c.RequestInfoResolver)
+	handler = genericapifilters.WithAuditID(handler)
 	return handler
 }
 
@@ -806,7 +883,7 @@ func installAPI(s *GenericAPIServer, c *Config) {
 	if c.EnableDiscovery {
 		s.Handler.GoRestfulContainer.Add(s.DiscoveryGroupManager.WebService())
 	}
-	if feature.DefaultFeatureGate.Enabled(features.APIPriorityAndFairness) {
+	if c.FlowControl != nil && feature.DefaultFeatureGate.Enabled(features.APIPriorityAndFairness) {
 		c.FlowControl.Install(s.Handler.NonGoRestfulMux)
 	}
 }

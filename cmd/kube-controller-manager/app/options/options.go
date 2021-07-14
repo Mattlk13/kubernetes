@@ -32,20 +32,23 @@ import (
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
+	cpoptions "k8s.io/cloud-provider/options"
 	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/component-base/logs"
 	"k8s.io/component-base/metrics"
+	cmoptions "k8s.io/controller-manager/options"
 	kubectrlmgrconfigv1alpha1 "k8s.io/kube-controller-manager/config/v1alpha1"
-	cmoptions "k8s.io/kubernetes/cmd/controller-manager/app/options"
 	kubecontrollerconfig "k8s.io/kubernetes/cmd/kube-controller-manager/app/config"
+	"k8s.io/kubernetes/pkg/cluster/ports"
 	kubectrlmgrconfig "k8s.io/kubernetes/pkg/controller/apis/config"
 	kubectrlmgrconfigscheme "k8s.io/kubernetes/pkg/controller/apis/config/scheme"
 	"k8s.io/kubernetes/pkg/controller/garbagecollector"
 	garbagecollectorconfig "k8s.io/kubernetes/pkg/controller/garbagecollector/config"
-	"k8s.io/kubernetes/pkg/master/ports"
 
 	// add the kubernetes feature gates
 	_ "k8s.io/kubernetes/pkg/features"
+
+	libgorestclient "github.com/openshift/library-go/pkg/config/client"
 )
 
 const (
@@ -56,8 +59,8 @@ const (
 // KubeControllerManagerOptions is the main context object for the kube-controller manager.
 type KubeControllerManagerOptions struct {
 	Generic           *cmoptions.GenericControllerManagerConfigurationOptions
-	KubeCloudShared   *cmoptions.KubeCloudSharedOptions
-	ServiceController *cmoptions.ServiceControllerOptions
+	KubeCloudShared   *cpoptions.KubeCloudSharedOptions
+	ServiceController *cpoptions.ServiceControllerOptions
 
 	AttachDetachController           *AttachDetachControllerOptions
 	CSRSigningController             *CSRSigningControllerOptions
@@ -71,6 +74,7 @@ type KubeControllerManagerOptions struct {
 	GarbageCollectorController       *GarbageCollectorControllerOptions
 	HPAController                    *HPAControllerOptions
 	JobController                    *JobControllerOptions
+	CronJobController                *CronJobControllerOptions
 	NamespaceController              *NamespaceControllerOptions
 	NodeIPAMController               *NodeIPAMControllerOptions
 	NodeLifecycleController          *NodeLifecycleControllerOptions
@@ -105,8 +109,8 @@ func NewKubeControllerManagerOptions() (*KubeControllerManagerOptions, error) {
 
 	s := KubeControllerManagerOptions{
 		Generic:         cmoptions.NewGenericControllerManagerConfigurationOptions(&componentConfig.Generic),
-		KubeCloudShared: cmoptions.NewKubeCloudSharedOptions(&componentConfig.KubeCloudShared),
-		ServiceController: &cmoptions.ServiceControllerOptions{
+		KubeCloudShared: cpoptions.NewKubeCloudSharedOptions(&componentConfig.KubeCloudShared),
+		ServiceController: &cpoptions.ServiceControllerOptions{
 			ServiceControllerConfiguration: &componentConfig.ServiceController,
 		},
 		AttachDetachController: &AttachDetachControllerOptions{
@@ -144,6 +148,9 @@ func NewKubeControllerManagerOptions() (*KubeControllerManagerOptions, error) {
 		},
 		JobController: &JobControllerOptions{
 			&componentConfig.JobController,
+		},
+		CronJobController: &CronJobControllerOptions{
+			&componentConfig.CronJobController,
 		},
 		NamespaceController: &NamespaceControllerOptions{
 			&componentConfig.NamespaceController,
@@ -189,7 +196,6 @@ func NewKubeControllerManagerOptions() (*KubeControllerManagerOptions, error) {
 
 	s.Authentication.RemoteKubeConfigFileOptional = true
 	s.Authorization.RemoteKubeConfigFileOptional = true
-	s.Authorization.AlwaysAllowPaths = []string{"/healthz"}
 
 	// Set the PairName but leave certificate directory blank to generate in-memory by default
 	s.SecureServing.ServerCert.CertDirectory = ""
@@ -245,6 +251,7 @@ func (s *KubeControllerManagerOptions) Flags(allControllers []string, disabledBy
 	s.GarbageCollectorController.AddFlags(fss.FlagSet("garbagecollector controller"))
 	s.HPAController.AddFlags(fss.FlagSet("horizontalpodautoscaling controller"))
 	s.JobController.AddFlags(fss.FlagSet("job controller"))
+	s.CronJobController.AddFlags(fss.FlagSet("cronjob controller"))
 	s.NamespaceController.AddFlags(fss.FlagSet("namespace controller"))
 	s.NodeIPAMController.AddFlags(fss.FlagSet("nodeipam controller"))
 	s.NodeLifecycleController.AddFlags(fss.FlagSet("nodelifecycle controller"))
@@ -266,6 +273,7 @@ func (s *KubeControllerManagerOptions) Flags(allControllers []string, disabledBy
 	fs.StringVar(&dummy, "insecure-experimental-approve-all-kubelet-csrs-for-group", "", "This flag does nothing.")
 	fs.StringVar(&s.OpenShiftContext.OpenShiftConfig, "openshift-config", s.OpenShiftContext.OpenShiftConfig, "indicates that this process should be compatible with openshift start master")
 	fs.MarkHidden("openshift-config")
+	fs.BoolVar(&s.OpenShiftContext.UnsupportedKubeAPIOverPreferredHost, "unsupported-kube-api-over-localhost", false, "when set makes KCM prefer talking to localhost kube-apiserver (when available) instead of LB")
 	utilfeature.DefaultMutableFeatureGate.AddFlag(fss.FlagSet("generic"))
 
 	return fss
@@ -313,6 +321,9 @@ func (s *KubeControllerManagerOptions) ApplyTo(c *kubecontrollerconfig.Config) e
 		return err
 	}
 	if err := s.JobController.ApplyTo(&c.ComponentConfig.JobController); err != nil {
+		return err
+	}
+	if err := s.CronJobController.ApplyTo(&c.ComponentConfig.CronJobController); err != nil {
 		return err
 	}
 	if err := s.NamespaceController.ApplyTo(&c.ComponentConfig.NamespaceController); err != nil {
@@ -391,6 +402,7 @@ func (s *KubeControllerManagerOptions) Validate(allControllers []string, disable
 	errs = append(errs, s.GarbageCollectorController.Validate()...)
 	errs = append(errs, s.HPAController.Validate()...)
 	errs = append(errs, s.JobController.Validate()...)
+	errs = append(errs, s.CronJobController.Validate()...)
 	errs = append(errs, s.NamespaceController.Validate()...)
 	errs = append(errs, s.NodeIPAMController.Validate()...)
 	errs = append(errs, s.NodeLifecycleController.Validate()...)
@@ -434,23 +446,22 @@ func (s KubeControllerManagerOptions) Config(allControllers []string, disabledBy
 	kubeconfig.QPS = s.Generic.ClientConnection.QPS
 	kubeconfig.Burst = int(s.Generic.ClientConnection.Burst)
 
+	if s.OpenShiftContext.PreferredHostRoundTripperWrapperFn != nil {
+		libgorestclient.DefaultServerName(kubeconfig)
+		kubeconfig.Wrap(s.OpenShiftContext.PreferredHostRoundTripperWrapperFn)
+	}
+
 	client, err := clientset.NewForConfig(restclient.AddUserAgent(kubeconfig, KubeControllerManagerUserAgent))
 	if err != nil {
 		return nil, err
 	}
 
-	// shallow copy, do not modify the kubeconfig.Timeout.
-	config := *kubeconfig
-	config.Timeout = s.Generic.LeaderElection.RenewDeadline.Duration
-	leaderElectionClient := clientset.NewForConfigOrDie(restclient.AddUserAgent(&config, "leader-election"))
-
 	eventRecorder := createRecorder(client, KubeControllerManagerUserAgent)
 
 	c := &kubecontrollerconfig.Config{
-		Client:               client,
-		Kubeconfig:           kubeconfig,
-		EventRecorder:        eventRecorder,
-		LeaderElectionClient: leaderElectionClient,
+		Client:        client,
+		Kubeconfig:    kubeconfig,
+		EventRecorder: eventRecorder,
 	}
 	if err := s.ApplyTo(c); err != nil {
 		return nil, err

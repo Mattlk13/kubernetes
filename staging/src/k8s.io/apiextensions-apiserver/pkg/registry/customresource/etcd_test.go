@@ -55,7 +55,6 @@ func newStorage(t *testing.T) (customresource.CustomResourceStorage, *etcd3testi
 	parameterScheme := runtime.NewScheme()
 	parameterScheme.AddUnversionedTypes(schema.GroupVersion{Group: "mygroup.example.com", Version: "v1beta1"},
 		&metav1.ListOptions{},
-		&metav1.ExportOptions{},
 		&metav1.GetOptions{},
 		&metav1.DeleteOptions{},
 	)
@@ -88,7 +87,7 @@ func newStorage(t *testing.T) (customresource.CustomResourceStorage, *etcd3testi
 		{Name: "Float64", Type: "number", JSONPath: ".spec.float64"},
 		{Name: "Bool", Type: "boolean", JSONPath: ".spec.bool"},
 	}
-	table, _ := tableconvertor.New(headers)
+	table, _ := tableconvertor.New(headers, schema.GroupVersionKind{Group: "mygroup.example.com", Version: "v1beta1", Kind: "NoxuItemList"})
 
 	storage := customresource.NewStorage(
 		schema.GroupResource{Group: "mygroup.example.com", Resource: "noxus"},
