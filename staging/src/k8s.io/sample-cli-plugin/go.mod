@@ -5,7 +5,7 @@ module k8s.io/sample-cli-plugin
 go 1.15
 
 require (
-	github.com/emicklei/go-restful v2.9.5+incompatible // indirect
+	github.com/emicklei/go-restful v2.16.0+incompatible // indirect
 	github.com/go-openapi/jsonreference v0.19.3 // indirect
 	github.com/go-openapi/spec v0.19.3 // indirect
 	github.com/mailru/easyjson v0.7.0 // indirect
